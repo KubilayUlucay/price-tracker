@@ -15,3 +15,5 @@ npm-debug.log
 # IDE / OS specific
 .vscode/
 .DS_Store
+
+scraper/browser_data/
