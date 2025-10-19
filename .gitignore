@@ -17,3 +17,21 @@ npm-debug.log
 .DS_Store
 
 scraper/browser_data/
+
+# Log files
+*.txt
+*.log
+
+# Data files
+*.csv
+*.json
+# --- IMPORTANT ---
+# We want to UN-ignore the "to-do list" file
+!all_urls.json
+
+# Screenshots
+*.png
+*.jpg
+*.jpeg
+
+BACKUP!/

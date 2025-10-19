@@ -1,0 +1,214 @@
+# scraper/koton_scraper.py
+
+import json
+import re
+import requests
+import time
+import random
+import datetime
+from pathlib import Path
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
+
+# --- All the code above this point is the same ---
+# (API_URL, USER_DATA_DIR, file paths, CATEGORIES_TO_SCRAPE, save_item_to_db)
+API_URL = "http://127.0.0.1:8000"
+USER_DATA_DIR = Path(__file__).parent / "browser_data"
+ALL_URLS_FILE = Path(__file__).parent / "all_urls.json"
+SCRAPED_URLS_FILE = Path(__file__).parent / "scraped_urls.json"
+
+CATEGORIES_TO_SCRAPE = [
+    # Full list of categories...
+    "https://www.koton.com/kadin-giyim/",
+    "https://www.koton.com/kadin-koton-jeans/",
+    "https://www.koton.com/sezon-trendleri",
+    "https://www.koton.com/kadin-abiye-davet/",
+    "https://www.koton.com/kadin-ic-giyim/",
+    "https://www.koton.com/sportclub/",
+    "https://www.koton.com/kadin-ofis-stili/",
+    "https://www.koton.com/kadin-aksesuar/",
+    "https://www.koton.com/genc-kadin-yeni-gelenler/",
+    "https://www.koton.com/genc-kadin-cok-satanlar/",
+    "https://www.koton.com/genc-kadin-giyim/",
+    "https://www.koton.com/coklu-paket-urunler-kadin/",
+    "https://www.koton.com/erkek-yeni-gelenler/",
+    "https://www.koton.com/erkek-giyim/",
+    "https://www.koton.com/erkek-koton-jeans/",
+    "https://www.koton.com/erkek-anasayfa",
+    "https://www.koton.com/erkek-pijama-ev-ve-ic-giyim/",
+    "https://www.koton.com/erkek-spor-giyim/",
+    "https://www.koton.com/erkek-aksesuar/",
+    "https://www.koton.com/indirim-anasayfa",
+    "https://www.koton.com/yuzde50-indirimli-urunler/",
+]
+
+def save_item_to_db(item_data: dict):
+    # This function is unchanged
+    try:
+        serial_code = item_data.get("serial_code")
+        if not serial_code:
+            print("❌ No serial code found, cannot save to DB.")
+            return False
+        response = requests.get(f"{API_URL}/items/by_serial_code/{serial_code}")
+        if response.status_code == 200:
+            print(f"-> Item '{serial_code}' already exists. Skipping.")
+            return True
+        if response.status_code == 404:
+            print(f"-> New item '{serial_code}'. Saving to database...")
+            create_response = requests.post(f"{API_URL}/items/", json=item_data)
+            if create_response.status_code == 200:
+                print(f"✅ Successfully saved item '{serial_code}'.")
+                return True
+            else:
+                print(f"❌ Failed to save item. API Status: {create_response.status_code}, Response: {create_response.json()}")
+                return False
+    except requests.exceptions.ConnectionError:
+        print("❌ Could not connect to the backend API. Is the uvicorn server running?")
+        return False
+    except Exception as e:
+        print(f"❌ An error occurred while saving to DB: {e}")
+        return False
+
+
+def scrape_koton_product(page: Page, url: str):
+    try:
+        page.goto(url, wait_until="networkidle", timeout=60000)
+
+        # Always try to accept cookies to prevent overlays from interfering
+        try:
+            page.get_by_role("button", name="Tüm çerezleri kabul et").click(timeout=3000)
+            print("... Cookie banner found and accepted.")
+        except PlaywrightTimeoutError:
+            pass # Continue if not found
+
+        html_content = page.content()
+
+# --- NEW, MORE ROBUST DATA EXTRACTION LOGIC (WITH DEBUGGING) ---
+        product_data = None
+        # This regex looks for a script block that contains "@type": "Product"
+        match = re.search(r'<script type="application/ld\+json">\s*(\{.*?"@type":\s*"Product".*?\})\s*</script>', html_content, re.DOTALL)
+        if match:
+            # Get the captured text
+            json_text_to_parse = match.group(1)
+            
+            # Print the text for debugging before we try to parse it
+            print("\n--- DEBUG: Text being sent to JSON parser ---")
+            print(json_text_to_parse)
+            print("--- END DEBUG ---\n")
+            
+            # Now, try to parse it
+            product_data = json.loads(json_text_to_parse)
+        
+        if not product_data:
+            raise ValueError("Could not find or parse Product JSON-LD using regex.")
+        # --- END OF NEW LOGIC ---
+
+        # The GA4 data extraction remains the same as it's reliable
+        soup = BeautifulSoup(html_content, 'html.parser')
+        ga4_script = soup.find('div', class_='js-ga4-product')
+        if not ga4_script or not ga4_script.string:
+            raise ValueError("Could not find GA4 product data for serial code.")
+        
+        ga4_data = json.loads(ga4_script.string)
+        serial_code = ga4_data.get('base_code')
+
+        scraped_item = {
+            "name": product_data.get('name'), "serial_code": serial_code,
+            "store": "Koton", "item_url": url,
+            "image_url": product_data.get('image', [])[0]
+        }
+        return save_item_to_db(scraped_item)
+
+    except Exception as e:
+        print(f"❌ Failed to scrape product page {url}. Error: {e}")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot_path = f"error_{timestamp}.png"
+        page.screenshot(path=screenshot_path)
+        print(f"📸 Screenshot saved as '{screenshot_path}' for debugging.")
+        return False
+
+# (The crawl_koton_category and if __name__ == "__main__" blocks are unchanged)
+def crawl_koton_category(page: Page, category_url: str):
+    # This function is unchanged
+    print(f"\n{'='*20}\nStarting crawl for category: {category_url}\n{'='*20}")
+    unique_urls = set()
+    page_number = 1
+    try:
+        while True:
+            page_url = f"{category_url}?page={page_number}"
+            print(f"--- Scanning page {page_number}... ---")
+            page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
+            if page.locator('text="İnsan olduğunuzu doğrulayalım"').is_visible():
+                print("❗ BOT DETECTION ACTIVATED. Please solve the CAPTCHA in the browser window.")
+                page.wait_for_selector('.list__products', timeout=300000)
+                print("✅ CAPTCHA likely solved. Retrying current page...")
+                continue
+            product_links = page.locator('a.product-link').all()
+            if not product_links:
+                print("Found 0 product links. Assuming end of category.")
+                break
+            for link in product_links:
+                href = link.get_attribute('href')
+                if href:
+                    unique_urls.add(f"https://www.koton.com{href}")
+            print(f"Scanned {len(product_links)} links on this page. Total unique for category: {len(unique_urls)}")
+            if page_number > 500: break
+            page_number += 1
+            time.sleep(random.uniform(2, 5))
+        print(f"Finished category crawl. Found {len(unique_urls)} total unique products.")
+        return list(unique_urls)
+    except Exception as e:
+        print(f"❌ An error occurred during category crawl: {e}")
+        return list(unique_urls)
+
+if __name__ == "__main__":
+    # This main block is unchanged
+    all_product_urls_to_scrape = []
+    if ALL_URLS_FILE.exists():
+        print("Found existing URL list. Loading from all_urls.json...")
+        with open(ALL_URLS_FILE, 'r') as f:
+            all_product_urls_to_scrape = json.load(f)
+    else:
+        print("No URL list found. Starting fresh crawl of all categories...")
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(user_data_dir=USER_DATA_DIR, headless=True)
+            page = context.new_page()
+            temp_urls = set()
+            for category_url in CATEGORIES_TO_SCRAPE:
+                product_urls = crawl_koton_category(page, category_url)
+                temp_urls.update(product_urls)
+                time.sleep(random.uniform(5, 10))
+            all_product_urls_to_scrape = list(temp_urls)
+            with open(ALL_URLS_FILE, 'w') as f:
+                json.dump(all_product_urls_to_scrape, f, indent=2)
+            print(f"Saved {len(all_product_urls_to_scrape)} URLs to all_urls.json.")
+            context.close()
+
+    scraped_urls = set()
+    if SCRAPED_URLS_FILE.exists():
+        with open(SCRAPED_URLS_FILE, 'r') as f:
+            scraped_urls = set(line.strip() for line in f)
+    print(f"Found {len(scraped_urls)} previously scraped URLs. They will be skipped.")
+
+    print(f"\n{'*'*50}\nTOTAL UNIQUE PRODUCTS TO PROCESS: {len(all_product_urls_to_scrape)}\n{'*'*50}")
+    
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(user_data_dir=USER_DATA_DIR, headless=True)
+        page = context.new_page()
+
+        for i, url in enumerate(list(all_product_urls_to_scrape), 1):
+            print(f"--- Scraping Master List Item {i}/{len(all_product_urls_to_scrape)} ---")
+            if url in scraped_urls:
+                print(f"URL already scraped. Skipping: {url}")
+                continue
+
+            success = scrape_koton_product(page, url)
+            
+            if success:
+                with open(SCRAPED_URLS_FILE, 'a') as f:
+                    f.write(f"{url}\n")
+            
+            time.sleep(random.uniform(1, 3))
+
+        print("\nFull crawl and scrape process finished.")
+        context.close()
